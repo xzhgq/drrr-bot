@@ -1,0 +1,32 @@
+name: DRRR JS Room Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+jobs:
+  run-js-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 檢出程式碼
+        uses: actions/checkout@v5
+
+      - name: 設定 Node.js 環境
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: 執行 JS 機器人
+        env:
+          NICKNAME: ${{ vars.NICKNAME || '罌粟' }}
+          TRIPCODE: ${{ vars.TRIPCODE || 'TW._.MIT' }}
+          ROOM_NAME: ${{ vars.ROOM_NAME || '深渊凝视著你' }}
+          ROOM_DESC: ${{ vars.ROOM_DESC || '与怪物战斗的人，应当小心自己不要变成怪物。当你凝视深渊时，深渊也在凝视着你。' }}
+          ROOM_LIMIT: ${{ vars.ROOM_LIMIT || '20' }}
+          DRRR_LANG: ${{ vars.DRRR_LANG || 'zh-TW' }}
+          REPORT_MINUTES: ${{ vars.REPORT_MINUTES || '20' }}
+          POLL_SECONDS: ${{ vars.POLL_SECONDS || '15' }}
+          RUN_HOURS: ${{ vars.RUN_HOURS || '5.7' }}
+          DRRR_COOKIE: ${{ secrets.DRRR_COOKIE }}
+        run: node bot.js
