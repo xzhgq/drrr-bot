@@ -44,7 +44,7 @@ def parse_cookies(raw_cookie: str) -> dict[str, str]:
 
 def clean_html_text(html: str) -> str:
   text = re.sub(r"<script[\s\S]*?</script>", " ", html, re.IGNORECASE)
-  text = re.sub(r"<style[\s\S]*?</style>", " ", text, re.IGNORECASE)
+  text = re.sub(r"<style[\s\S]*?</style>", " ", html, re.IGNORECASE)
   text = re.sub(r"<[^>]+>", " ", text)
   return re.sub(r"\s+", " ", text).strip()
 
@@ -202,6 +202,49 @@ def extract_room_url(html: str, url_now: str) -> str:
   return ""
 
 
+def apply_music_fields(
+    form_html: str, data: dict[str, str], enable_music: bool
+) -> list[str]:
+  """
+    在建房表單中尋找音樂/音訊相關欄位並依 enable_music 設定值。
+    回傳有被寫入或勾選的欄位名稱清單。
+    """
+  music_keywords = ("music", "audio", "sound", "音樂", "音源")
+  touched: list[str] = []
+
+  for inp_m in re.finditer(r"<input[^>]*>", form_html, re.IGNORECASE):
+    tag = inp_m.group(0)
+    nm_m = re.search(r'name=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+    if not nm_m:
+      continue
+    fname = nm_m.group(1)
+    id_m = re.search(r'id=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+    fid = id_m.group(1) if id_m else ""
+    type_m = re.search(r'type=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+    ftype = (type_m.group(1) if type_m else "text").lower()
+    val_m = re.search(r'value=["\']([^"\']*)["\']', tag, re.IGNORECASE)
+    raw_val = val_m.group(1) if val_m else ""
+
+    # 往後看一小段 HTML 標籤文字，輔助判斷是否為音樂選項
+    span_start = inp_m.end()
+    nearby_text = clean_html_text(form_html[span_start : span_start + 120])
+    combined_meta = f"{fname} {fid} {raw_val} {nearby_text}".lower()
+
+    if any(kw in combined_meta for kw in music_keywords):
+      if ftype == "checkbox":
+        if enable_music:
+          data[fname] = raw_val if raw_val else "on"
+          touched.append(fname)
+        else:
+          data.pop(fname, None)
+      else:
+        if enable_music:
+          data[fname] = raw_val if raw_val else "1"
+          touched.append(fname)
+
+  return touched
+
+
 def create_room(
     session: requests.Session,
     html: str,
@@ -211,11 +254,12 @@ def create_room(
     room_desc: str,
     limit: str,
     lang: str,
+    enable_music: bool = True,
 ) -> tuple[bool, str, str, str]:
   """嘗試建立房間，回傳 (是否成功, 最新HTML, 最新URL, 房間URL)"""
   print(
       f"    [建房] 嘗試建立房間 -> 房名: {room_name} | 上限: {limit} | 語系:"
-      f" {lang}"
+      f" {lang} | 音樂: {'開啟' if enable_music else '關閉'}"
   )
   target_html = html
   target_url = url_now
@@ -239,7 +283,12 @@ def create_room(
         "    ⚠️ [建房] 目前頁面未找到建房表單，頁面片段:",
         clean_html_text(target_html)[:240],
     )
-    return False, target_html, target_url, extract_room_url(target_html, target_url)
+    return (
+        False,
+        target_html,
+        target_url,
+        extract_room_url(target_html, target_url),
+    )
 
   form_html = form_m.group(0)
   act_m = re.search(r'action=["\']([^"\']*)["\']', form_html, re.IGNORECASE)
@@ -263,6 +312,15 @@ def create_room(
       "limit": str(limit),
       "language": lang,
   })
+
+  music_fields = apply_music_fields(form_html, data, enable_music)
+  if enable_music:
+    if music_fields:
+      print(f"    🎵 [建房] 已自動勾選/帶入音樂欄位: {music_fields}")
+    else:
+      print(
+          "    🎵 [建房] 已啟用音樂開關，但表單未偵測到明確的音樂欄位（若需特定欄位可再對齊）。"
+      )
 
   time.sleep(random.uniform(0.6, 1.6))
   r_create = session.post(post_url, data=data, headers=headers, timeout=25)
@@ -295,7 +353,6 @@ def send_room_me_message(
   current_url = url_now
   formatted_msg = f"/me {me_text.lstrip()}"
 
-  # 若目前不在房間頁且有已知房間網址，先回到房間頁取得最新表單
   if "/room" not in current_url and room_url:
     resp_room = session.get(room_url, headers=headers, timeout=20)
     current_html = resp_room.text
@@ -303,7 +360,6 @@ def send_room_me_message(
     if is_cf_blocked(current_html):
       return False, current_html, current_url
 
-  # 尋找可能的聊天輸入表單
   forms = re.findall(r"<form[\s\S]*?</form>", current_html, re.IGNORECASE)
   candidate_msg_fields = [
       "message",
@@ -319,9 +375,7 @@ def send_room_me_message(
   msg_field_name = ""
 
   for f_html in forms:
-    inputs = re.findall(
-        r"<(?:input|textarea)[^>]*>", f_html, re.IGNORECASE
-    )
+    inputs = re.findall(r"<(?:input|textarea)[^>]*>", f_html, re.IGNORECASE)
     for inp in inputs:
       nm_m = re.search(r'name=["\']([^"\']+)["\']', inp, re.IGNORECASE)
       if not nm_m:
@@ -361,8 +415,11 @@ def send_room_me_message(
       return False, new_html, new_url
     return True, new_html, new_url
 
-  # 備援：若頁面為 JSON/AJAX 結構或表單未匹配，嘗試送往常見房間訊息端點
-  post_target = room_url or (current_url if "/room" in current_url else "https://drrr.com/room/")
+  post_target = (
+      room_url
+      if room_url
+      else (current_url if "/room" in current_url else "https://drrr.com/room/")
+  )
   for field in ("message", "msg", "text"):
     try:
       r_fb = session.post(
@@ -401,11 +458,9 @@ def check_room_alive(
   if "/room" in url_now:
     return True, True, html, url_now, url_now
 
-  # 若原本有 room_url 但被導向到別處（例如大廳），代表已離開或掉房
   if room_url and "/lounge" in url_now:
     return True, False, html, url_now, ""
 
-  # 若目前在大廳，檢查房間名稱是否仍在列表中
   clean_txt = clean_html_text(html)
   if "lounge" in url_now:
     room_present = (room_name in html) or (room_name in clean_txt)
@@ -423,9 +478,15 @@ def main() -> None:
       "ROOM_DESC",
       "与怪物战斗的人，应当小心自己不要变成怪物。当你凝视深渊时，深渊也在凝视着你。",
   ).strip()
-  limit = os.environ.get("ROOM_LIMIT", "20").strip()
+  limit = os.environ.get("ROOM_LIMIT", "2").strip()
   lang = os.environ.get("DRRR_LANG", "zh-TW").strip()
   raw_cookie = os.environ.get("DRRR_COOKIE", "").strip()
+  enable_music = os.environ.get("ENABLE_MUSIC", "1").strip().lower() in (
+      "1",
+      "true",
+      "yes",
+      "on",
+  )
 
   try:
     heartbeat_hours = float(os.environ.get("HEARTBEAT_HOURS", "8").strip())
@@ -491,7 +552,15 @@ def main() -> None:
 
   print("[3] 初始建房流程...")
   _, html, url_now, room_url = create_room(
-      session, html, url_now, headers, room_name, room_desc, limit, lang
+      session,
+      html,
+      url_now,
+      headers,
+      room_name,
+      room_desc,
+      limit,
+      lang,
+      enable_music=enable_music,
   )
   last_recreate_ts = time.time()
   last_announce_ts = time.time()
@@ -548,7 +617,15 @@ def main() -> None:
               f"    🛠️ 偵測到掉房（距離上次建房 {since_last:.1f} 秒），開始自動重新建房..."
           )
           _, html, url_now, room_url = create_room(
-              session, html, url_now, headers, room_name, room_desc, limit, lang
+              session,
+              html,
+              url_now,
+              headers,
+              room_name,
+              room_desc,
+              limit,
+              lang,
+              enable_music=enable_music,
           )
           last_recreate_ts = time.time()
         else:
@@ -557,7 +634,6 @@ def main() -> None:
               f"    ⏳ 房間不在線上，但仍在重建冷卻中（剩餘 {wait_left:.1f} 秒）。"
           )
 
-      # 每 5 分鐘（台灣時間）發送一次 /me 小字報時
       now_ts = time.time()
       if room_alive and (now_ts - last_announce_ts >= announce_interval):
         tw_now_str = datetime.now(TAIWAN_TZ).strftime("%Y-%m-%d %H:%M")
