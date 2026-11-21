@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -21,6 +22,8 @@ CF_MARKERS = [
     "Verify you are human",
     "Checking your browser",
 ]
+
+TAIWAN_TZ = timezone(timedelta(hours=8))
 
 
 def is_cf_blocked(text: str) -> bool:
@@ -170,7 +173,6 @@ def perform_login(
       urljoin(str(base_url), act_m.group(1)) if act_m else "https://drrr.com/"
   )
 
-  # 模擬真人填表後停頓一小段時間再送出
   time.sleep(random.uniform(0.8, 2.0))
   resp2 = session.post(post_url, data=payload, headers=headers, timeout=25)
   new_html = resp2.text
@@ -191,6 +193,15 @@ def perform_login(
   return True, new_html, new_url
 
 
+def extract_room_url(html: str, url_now: str) -> str:
+  if "/room" in url_now:
+    return url_now
+  m = re.search(r'href=["\']([^"\']*?/room[^"\']*)["\']', html, re.IGNORECASE)
+  if m:
+    return urljoin("https://drrr.com/", m.group(1))
+  return ""
+
+
 def create_room(
     session: requests.Session,
     html: str,
@@ -200,8 +211,8 @@ def create_room(
     room_desc: str,
     limit: str,
     lang: str,
-) -> tuple[bool, str, str]:
-  """嘗試建立房間，回傳 (是否成功送出建房表單, 最新HTML, 最新URL)"""
+) -> tuple[bool, str, str, str]:
+  """嘗試建立房間，回傳 (是否成功, 最新HTML, 最新URL, 房間URL)"""
   print(
       f"    [建房] 嘗試建立房間 -> 房名: {room_name} | 上限: {limit} | 語系:"
       f" {lang}"
@@ -214,7 +225,7 @@ def create_room(
     r_lounge = session.get("https://drrr.com/lounge", headers=headers, timeout=20)
     if is_cf_blocked(r_lounge.text):
       print("    ❌ [建房] 進入大廳命中 Cloudflare 驗證。")
-      return False, r_lounge.text, str(r_lounge.url)
+      return False, r_lounge.text, str(r_lounge.url), ""
     target_html = r_lounge.text
     target_url = str(r_lounge.url)
 
@@ -228,7 +239,7 @@ def create_room(
         "    ⚠️ [建房] 目前頁面未找到建房表單，頁面片段:",
         clean_html_text(target_html)[:240],
     )
-    return False, target_html, target_url
+    return False, target_html, target_url, extract_room_url(target_html, target_url)
 
   form_html = form_m.group(0)
   act_m = re.search(r'action=["\']([^"\']*)["\']', form_html, re.IGNORECASE)
@@ -257,64 +268,151 @@ def create_room(
   r_create = session.post(post_url, data=data, headers=headers, timeout=25)
   new_html = r_create.text
   new_url = str(r_create.url)
-  print(f"    [建房] 回應狀態碼: {r_create.status_code} | 網址: {new_url}")
+  room_url = extract_room_url(new_html, new_url)
+  print(
+      f"    [建房] 回應狀態碼: {r_create.status_code} | 網址: {new_url}"
+      f" | 房址: {room_url or '未取得'}"
+  )
   print("    [建房] 頁面片段:", clean_html_text(new_html)[:240])
 
   if is_cf_blocked(new_html):
     print("    ❌ [建房] 建房回應命中 Cloudflare 驗證。")
-    return False, new_html, new_url
+    return False, new_html, new_url, room_url
 
-  return True, new_html, new_url
+  return True, new_html, new_url, room_url
+
+
+def send_room_me_message(
+    session: requests.Session,
+    html: str,
+    url_now: str,
+    room_url: str,
+    headers: dict[str, str],
+    me_text: str,
+) -> tuple[bool, str, str]:
+  """在房間內以 /me 小字發送訊息，回傳 (是否送出成功, 最新HTML, 最新URL)"""
+  current_html = html
+  current_url = url_now
+  formatted_msg = f"/me {me_text.lstrip()}"
+
+  # 若目前不在房間頁且有已知房間網址，先回到房間頁取得最新表單
+  if "/room" not in current_url and room_url:
+    resp_room = session.get(room_url, headers=headers, timeout=20)
+    current_html = resp_room.text
+    current_url = str(resp_room.url)
+    if is_cf_blocked(current_html):
+      return False, current_html, current_url
+
+  # 尋找可能的聊天輸入表單
+  forms = re.findall(r"<form[\s\S]*?</form>", current_html, re.IGNORECASE)
+  candidate_msg_fields = [
+      "message",
+      "msg",
+      "text",
+      "say",
+      "comment",
+      "content",
+      "body",
+  ]
+
+  target_form_html = ""
+  msg_field_name = ""
+
+  for f_html in forms:
+    inputs = re.findall(
+        r"<(?:input|textarea)[^>]*>", f_html, re.IGNORECASE
+    )
+    for inp in inputs:
+      nm_m = re.search(r'name=["\']([^"\']+)["\']', inp, re.IGNORECASE)
+      if not nm_m:
+        continue
+      fname = nm_m.group(1)
+      if fname.lower() in candidate_msg_fields:
+        target_form_html = f_html
+        msg_field_name = fname
+        break
+    if target_form_html:
+      break
+
+  if target_form_html and msg_field_name:
+    act_m = re.search(
+        r'action=["\']([^"\']*)["\']', target_form_html, re.IGNORECASE
+    )
+    post_url = (
+        urljoin(current_url, act_m.group(1)) if act_m else current_url
+    )
+    payload: dict[str, str] = {}
+    for hm in re.finditer(
+        r'<input[^>]*type=["\']?hidden["\']?[^>]*>',
+        target_form_html,
+        re.IGNORECASE,
+    ):
+      nm = re.search(r'name=["\']([^"\']+)["\']', hm.group(0), re.IGNORECASE)
+      vm = re.search(r'value=["\']([^"\']*)["\']', hm.group(0), re.IGNORECASE)
+      if nm:
+        payload[nm.group(1)] = vm.group(1) if vm else ""
+    payload[msg_field_name] = formatted_msg
+
+    time.sleep(random.uniform(0.4, 1.2))
+    r_send = session.post(post_url, data=payload, headers=headers, timeout=20)
+    new_html = r_send.text
+    new_url = str(r_send.url)
+    if is_cf_blocked(new_html):
+      return False, new_html, new_url
+    return True, new_html, new_url
+
+  # 備援：若頁面為 JSON/AJAX 結構或表單未匹配，嘗試送往常見房間訊息端點
+  post_target = room_url or (current_url if "/room" in current_url else "https://drrr.com/room/")
+  for field in ("message", "msg", "text"):
+    try:
+      r_fb = session.post(
+          post_target, data={field: formatted_msg}, headers=headers, timeout=15
+      )
+      if r_fb.status_code in (200, 204) and not is_cf_blocked(r_fb.text):
+        return True, r_fb.text, str(r_fb.url)
+    except Exception:
+      continue
+
+  return False, current_html, current_url
 
 
 def check_room_alive(
     session: requests.Session,
     headers: dict[str, str],
     room_name: str,
-    beat_idx: int,
-) -> tuple[bool, bool, str, str]:
+    room_url: str,
+) -> tuple[bool, bool, str, str, str]:
   """
-    檢查目前連線與房間狀態。
-    回傳 (是否仍登入, 房間是否仍在線上, 最新HTML, 最新URL)
+    優先檢查房間狀態，避免沒事就去 /lounge 導致被視為離開房間。
+    回傳 (是否仍登入, 房間是否仍在線上, 最新HTML, 最新URL, 房間URL)
     """
-  # 輪流走訪不同頁面，避免完全單一固定請求
-  probe_targets = [
-      ("https://drrr.com/lounge", "https://drrr.com/"),
-      ("https://drrr.com/", "https://drrr.com/lounge"),
-  ]
-  target_url, referer_url = probe_targets[beat_idx % len(probe_targets)]
-  req_headers = dict(headers)
-  req_headers["Referer"] = referer_url
-
-  resp = session.get(target_url, headers=req_headers, timeout=20)
+  target_url = room_url if room_url else "https://drrr.com/lounge"
+  resp = session.get(target_url, headers=headers, timeout=20)
   html = resp.text
   url_now = str(resp.url)
 
   if is_cf_blocked(html):
-    return False, False, html, url_now
+    return False, False, html, url_now, room_url
 
   has_login_form = ('id="form-name"' in html) or ('name="login"' in html)
-  if has_login_form and ("lounge" not in url_now) and ("room" not in url_now):
-    return False, False, html, url_now
+  if has_login_form and ("lounge" not in url_now) and ("/room" not in url_now):
+    return False, False, html, url_now, room_url
 
-  # 若已進入房間頁面，通常網址或頁面會有 room 相關特徵
-  in_room_page = ("/room" in url_now) or ("room-title" in html.lower())
-  if in_room_page:
-    return True, True, html, url_now
+  if "/room" in url_now:
+    return True, True, html, url_now, url_now
 
-  # 若在大廳頁，檢查房名是否仍出現在大廳列表中
+  # 若原本有 room_url 但被導向到別處（例如大廳），代表已離開或掉房
+  if room_url and "/lounge" in url_now:
+    return True, False, html, url_now, ""
+
+  # 若目前在大廳，檢查房間名稱是否仍在列表中
   clean_txt = clean_html_text(html)
   if "lounge" in url_now:
     room_present = (room_name in html) or (room_name in clean_txt)
-    return True, room_present, html, url_now
+    found_room_url = extract_room_url(html, url_now)
+    return True, room_present, html, url_now, found_room_url
 
-  # 其他已登入頁面（如首頁），保守判斷為已登入，但無法確認房間時交由大廳再核對一次
-  r_lounge = session.get("https://drrr.com/lounge", headers=headers, timeout=20)
-  if is_cf_blocked(r_lounge.text):
-    return False, False, r_lounge.text, str(r_lounge.url)
-  lounge_clean = clean_html_text(r_lounge.text)
-  room_present = (room_name in r_lounge.text) or (room_name in lounge_clean)
-  return True, room_present, r_lounge.text, str(r_lounge.url)
+  return True, True, html, url_now, room_url
 
 
 def main() -> None:
@@ -334,11 +432,18 @@ def main() -> None:
   except ValueError:
     heartbeat_hours = 8.0
 
+  try:
+    announce_minutes = max(
+        0.5, float(os.environ.get("ANNOUNCE_MINUTES", "5").strip())
+    )
+  except ValueError:
+    announce_minutes = 5.0
+
+  announce_interval = announce_minutes * 60.0
   heartbeat_interval = 15
   duration_seconds = max(15.0, heartbeat_hours * 3600.0)
   total_beats = int(duration_seconds // heartbeat_interval)
 
-  # 掉房重建冷卻秒數（預設 20 秒），避免短時間內重複建房被限制
   try:
     recreate_cooldown = max(
         5.0, float(os.environ.get("RECREATE_COOLDOWN", "20").strip())
@@ -385,21 +490,21 @@ def main() -> None:
     print("✅ 已處於登入狀態，跳過登入表單。")
 
   print("[3] 初始建房流程...")
-  _, html, url_now = create_room(
+  _, html, url_now, room_url = create_room(
       session, html, url_now, headers, room_name, room_desc, limit, lang
   )
   last_recreate_ts = time.time()
+  last_announce_ts = time.time()
 
   start_ts = time.time()
   end_ts = start_ts + duration_seconds
   print(
-      f"[4] 開始保活心跳（目標 {heartbeat_hours:g} 小時，約 {total_beats} 輪，"
-      f"基準間隔 {heartbeat_interval} 秒 + 隨機抖動）..."
+      f"[4] 開始保活心跳（目標 {heartbeat_hours:g} 小時，每"
+      f" {announce_minutes:g} 分鐘台灣時間 /me 報時）..."
   )
 
   idx = 0
   while time.time() < end_ts:
-    # 模擬活人節奏：每次心跳在基準秒數附近加入小幅隨機浮動
     jitter = random.uniform(-3.0, 5.0)
     sleep_sec = max(8.0, heartbeat_interval + jitter)
     remaining = end_ts - time.time()
@@ -413,8 +518,8 @@ def main() -> None:
     elapsed_min = int((time.time() - start_ts) // 60)
 
     try:
-      logged_in, room_alive, html, url_now = check_room_alive(
-          session, headers, room_name, idx
+      logged_in, room_alive, html, url_now, room_url = check_room_alive(
+          session, headers, room_name, room_url
       )
       cf_hit = is_cf_blocked(html)
 
@@ -427,7 +532,6 @@ def main() -> None:
         print("    ⚠️ 偵測到 Cloudflare 驗證，提前停止心跳。")
         break
 
-      # 若掉線或被登出，先嘗試補登入
       if not logged_in:
         print("    🔄 偵測到未登入狀態，嘗試重新登入...")
         ok_login, html, url_now = perform_login(
@@ -437,14 +541,13 @@ def main() -> None:
           print("    ⚠️ 重新登入未成功，等待下一輪心跳再試。")
           continue
 
-      # 若已登入但房間不在線上，且已過冷卻時間，自動重新建房
       if not room_alive:
         since_last = time.time() - last_recreate_ts
         if since_last >= recreate_cooldown:
           print(
               f"    🛠️ 偵測到掉房（距離上次建房 {since_last:.1f} 秒），開始自動重新建房..."
           )
-          _, html, url_now = create_room(
+          _, html, url_now, room_url = create_room(
               session, html, url_now, headers, room_name, room_desc, limit, lang
           )
           last_recreate_ts = time.time()
@@ -452,6 +555,22 @@ def main() -> None:
           wait_left = recreate_cooldown - since_last
           print(
               f"    ⏳ 房間不在線上，但仍在重建冷卻中（剩餘 {wait_left:.1f} 秒）。"
+          )
+
+      # 每 5 分鐘（台灣時間）發送一次 /me 小字報時
+      now_ts = time.time()
+      if room_alive and (now_ts - last_announce_ts >= announce_interval):
+        tw_now_str = datetime.now(TAIWAN_TZ).strftime("%Y-%m-%d %H:%M")
+        me_content = f"台灣時間 {tw_now_str}"
+        sent, html, url_now = send_room_me_message(
+            session, html, url_now, room_url, headers, me_content
+        )
+        last_announce_ts = now_ts
+        if sent:
+          print(f"    🕒 已發送小字報時: /me {me_content}")
+        else:
+          print(
+              "    ⚠️ 嘗試發送小字報時未成功（可能需依實際房間表單欄位微調）。"
           )
 
     except Exception as exc:
