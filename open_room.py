@@ -423,7 +423,7 @@ def main() -> None:
       "ROOM_DESC",
       "与怪物战斗的人，应当小心自己不要变成怪物。当你凝视深渊时，深渊也在凝视着你。",
   ).strip()
-  limit = os.environ.get("ROOM_LIMIT", "2").strip()
+  limit = os.environ.get("ROOM_LIMIT", "20").strip()
   lang = os.environ.get("DRRR_LANG", "zh-TW").strip()
   raw_cookie = os.environ.get("DRRR_COOKIE", "").strip()
 
