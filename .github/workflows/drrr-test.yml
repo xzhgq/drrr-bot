@@ -28,7 +28,7 @@ jobs:
           TRIPCODE: ${{ vars.TRIPCODE || 'TW._.MIT' }}
           ROOM_NAME: ${{ vars.ROOM_NAME || '深渊凝视著你' }}
           ROOM_DESC: ${{ vars.ROOM_DESC || '与怪物战斗的人，应当小心自己不要变成怪物。当你凝视深渊时，深渊也在凝视着你。' }}
-          ROOM_LIMIT: ${{ vars.ROOM_LIMIT || '2' }}
+          ROOM_LIMIT: ${{ vars.ROOM_LIMIT || '20' }}
           DRRR_LANG: ${{ vars.DRRR_LANG || 'zh-TW' }}
           DRRR_COOKIE: ${{ secrets.DRRR_COOKIE }}
         run: python open_room.py
